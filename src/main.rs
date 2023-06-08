@@ -7,12 +7,16 @@ mod repositories;
 mod schema;
 
 use auth::BasicAuth;
+use diesel::result::Error::NotFound;
 use repositories::RustaceanRepository;
 
 use models::{NewRustacean, Rustacean};
 use rocket::{
-    response::status,
+    fairing::AdHoc,
+    http::Status,
+    response::status::{self, Custom},
     serde::json::{json, Json, Value},
+    Build, Rocket,
 };
 use rocket_sync_db_pools::database;
 
@@ -20,20 +24,24 @@ use rocket_sync_db_pools::database;
 struct DbConn(diesel::SqliteConnection);
 
 #[get("/rustaceans")]
-async fn get_rustaceans(_auth: BasicAuth, db: DbConn) -> Value {
+async fn get_rustaceans(_auth: BasicAuth, db: DbConn) -> Result<Value, Custom<Value>> {
     db.run(|c| {
-        let rustaceans = RustaceanRepository::find_multiple(c, 100).expect("DB Error");
-        json!(rustaceans)
+        RustaceanRepository::find_multiple(c, 100)
+            .map(|rustacean| json!(rustacean))
+            .map_err(|e| match e {
+                NotFound => Custom(Status::NotFound, json!(e.to_string())),
+                _ => Custom(Status::InternalServerError, json!(e.to_string())),
+            })
     })
     .await
 }
 
 #[get("/rustaceans/<id>")]
-async fn view_rustaceans(id: i32, _auth: BasicAuth, db: DbConn) -> Value {
+async fn view_rustaceans(id: i32, _auth: BasicAuth, db: DbConn) -> Result<Value, Custom<Value>> {
     db.run(move |c| {
-        let rustacean =
-            RustaceanRepository::find(c, id).expect("DB Error when selecting rustacean");
-        json!(rustacean)
+        RustaceanRepository::find(c, id)
+            .map(|rustacean| json!(rustacean))
+            .map_err(|e| Custom(Status::InternalServerError, json!(e.to_string())))
     })
     .await
 }
@@ -43,11 +51,11 @@ async fn create_rustaceans(
     _auth: BasicAuth,
     db: DbConn,
     new_rustacean: Json<NewRustacean>,
-) -> Value {
+) -> Result<Value, Custom<Value>> {
     db.run(|c| {
-        let result = RustaceanRepository::create(c, new_rustacean.into_inner())
-            .expect("DB Error when Inserting");
-        json!(result)
+        RustaceanRepository::create(c, new_rustacean.into_inner())
+            .map(|rustacean| json!(rustacean))
+            .map_err(|e| Custom(Status::InternalServerError, json!(e.to_string())))
     })
     .await
 }
@@ -58,22 +66,50 @@ async fn update_rustaceans(
     _auth: BasicAuth,
     db: DbConn,
     rustacean: Json<Rustacean>,
-) -> Value {
+) -> Result<Value, Custom<Value>> {
     db.run(move |c| {
-        let result = RustaceanRepository::save(c, id, rustacean.into_inner())
-            .expect("DB Error when updating");
-        json!(result)
+        RustaceanRepository::save(c, id, rustacean.into_inner())
+            .map(|rustacean| json!(rustacean))
+            .map_err(|e| Custom(Status::InternalServerError, json!(e.to_string())))
     })
     .await
 }
 
 #[delete("/rustaceans/<id>")]
-async fn delete_rustaceans(id: i32, _auth: BasicAuth, db: DbConn) -> status::NoContent {
+async fn delete_rustaceans(
+    id: i32,
+    _auth: BasicAuth,
+    db: DbConn,
+) -> Result<status::NoContent, Custom<Value>> {
     db.run(move |c| {
-        RustaceanRepository::delete(c, id).expect("DB Error when deleting");
-        status::NoContent
+        if RustaceanRepository::find(c, id).is_err() {
+            return Err(status::Custom(
+                rocket::http::Status::NotFound,
+                json!(String::from("Can't delete. Rustacean not found")),
+            ));
+        }
+
+        RustaceanRepository::delete(c, id)
+            .map(|_| status::NoContent)
+            .map_err(|e| Custom(Status::InternalServerError, json!(e.to_string())))
     })
     .await
+}
+
+async fn run_db_migrations(rocket: Rocket<Build>) -> Rocket<Build> {
+    use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+    DbConn::get_one(&rocket)
+        .await
+        .expect("Unable to retrieve connection")
+        .run(|c| {
+            c.run_pending_migrations(MIGRATIONS)
+                .expect("Migration failed");
+        })
+        .await;
+
+    rocket
 }
 
 #[catch(404)]
@@ -106,6 +142,7 @@ async fn main() {
         )
         .register("/", catchers![not_found, authorization, unprocessable])
         .attach(DbConn::fairing()) //接続確認を行う
+        .attach(AdHoc::on_ignite("Diesel migrations", run_db_migrations))
         .launch()
         .await;
 }
